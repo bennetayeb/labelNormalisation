@@ -1,46 +1,68 @@
-
-import os
-import numpy, re, sys
+import numpy, re, sys,argparse, os, logging
 from multiprocessing import Pool
 from scipy.stats import norm
-import math
-import logging
 from multiprocessing.pool import ThreadPool as Pool
+from labelNorm import LabelNormalisation
 from binaryIOCollection import BinaryIOCollection
-from linguisticBase import LinguisticBase
 from loadPhonems import qs_file_name, ori_file_list, output_file_list
+from tqdm import tqdm
+import codecs
+import multiprocessing as mp
 
 
-class LabelNormalisation(LinguisticBase):
-
-    # this class only knows how to deal with a single style of labels (XML or HTS)
-    # (to deal with composite labels, use LabelComposer instead)
-
-    def __init__(self, question_file_name=None, xpath_file_name=None):
-        pass
-
-    def extract_linguistic_features(self, in_file_name, out_file_name=None, label_type="state_align",
-                                    dur_file_name=None):
-        if label_type == "phone_align":
-
-            A = self.load_labels_with_phone_alignment(in_file_name, dur_file_name)
-            print(" A shape {} ".format(A.shape))
-        elif label_type == "state_align":
-            A = self.load_labels_with_state_alignment(in_file_name)
-        else:
-            logger.critical("we don't support %s labels as of now!!" % (label_type))
-
-        if out_file_name:
-            io_funcs = BinaryIOCollection()
-            io_funcs.array_to_binary_file(A, out_file_name)
-        else:
-            return A
 
 
-#  -----------------------------
+def run(args):
+    inFile, out_dir, config = args
+    #
+    outFile = os.path.join(out_dir, os.path.basename(inFile))
+    outFile = [outFile]
 
+    inFile = [inFile]
+
+    #
+    print(outFile, inFile)
+    label_operater = HTSLabelNormalisation(question_file_name=config['qs_file_name'], add_frame_features=False,
+                                           subphone_feats='none')
+    data = label_operater.perform_normalisation(inFile, outFile, label_type=config['label_type'])
+    # features, frames_num = BinaryIOCollection().load_binary_file_frame(outFile,label_operater.dimension)
+    # print(" {} : features shape {} ".format(os.path.basename(inFile),features.shape))
+
+def build_arg_parser():
+
+    parser = argparse.ArgumentParser(description='parse')
+    parser.add_argument('file_id_list', type=str, help='input folder ')
+    parser.add_argument('output_dir', type=str, help='input folder ')
+    # parser.add_argument('qs_file_name',type=str,default='/mnt/mydrive/home/aghilas/Workspace/Experiments/SynPaFlex-Code/VoiceConversion/cvc-via-ppg/data_fr/misc_question/questions-french_pau-v0.hed',help='input folder ')
+    # parser.add_argument('label_type',type=str,default='phone_align',help='input folder ')
+
+
+def upSampling(labFile, sampling_rate=22050, hop_length=221, delta=100000):
+    # Creates a file and returns a tuple containing both the handle and the path.
+    flab_path = os.path.splitext(labFile)[0] + '.flab'
+    with open(flab_path, "w") as f:
+        fid = open(labFile)
+        utt_labels = fid.readlines()
+        fid.close()
+        for line in utt_labels:
+            line = line.strip()
+            temp_list = re.split('\s+', line)
+            start_time = int(temp_list[0])
+            end_time = int(temp_list[1])
+            full_label = temp_list[2]
+
+            start_samples=(start_time*1e-7)*sampling_rate
+            end_samples=(end_time*1e-7)*sampling_rate
+
+            frame_number = int(end_samples / hop_length) - int(start_samples / hop_length)
+            i = 0
+            while i < frame_number:
+                f.write("{} {} {}\n".format(start_time + i * delta, start_time + (i + 1) * delta, full_label))
+                i += 1
+    return flab_path
 
 class HTSLabelNormalisation(LabelNormalisation):
+
     """This class is to convert HTS format labels into continous or binary values, and store as binary format with float32 precision.
     The class supports two kinds of questions: QS and CQS.
         **QS**: is the same as that used in HTS
@@ -64,7 +86,7 @@ class HTSLabelNormalisation(LabelNormalisation):
         self.dict_size = 0
         self.continuous_flag = continuous_flag
         try:
-            #            self.question_dict, self.ori_question_dict = self.load_question_set(question_file_name)
+            # self.question_dict, self.ori_question_dict = self.load_question_set(question_file_name)
             self.discrete_dict, self.continuous_dict = self.load_question_set_continous(question_file_name)
         except:
             logger.critical('error whilst loading HTS question set')
@@ -265,8 +287,10 @@ class HTSLabelNormalisation(LabelNormalisation):
                 dur_feature_index = dur_feature_index + frame_number
             elif state_index == state_number:
                 if feat_size == "phoneme":
+
                     dur_feature_matrix[dur_feature_index:dur_feature_index + 1, ] = current_block_array
                     dur_feature_index = dur_feature_index + 1
+                    print('writing into dur_feature_matrix')
                 elif current_phone != '#':  ## removing silence here
                     if feat_size == "syllable" and syl_end:
                         dur_feature_matrix[dur_feature_index:dur_feature_index + 1, ] = current_block_array
@@ -415,8 +439,8 @@ class HTSLabelNormalisation(LabelNormalisation):
             label_binary_vector = self.pattern_matching_binary(full_label)
 
             # if there is no CQS question, the label_continuous_vector will become to empty
-            label_continuous_vector = self.pattern_matching_continous_position(full_label)
-            label_vector = numpy.concatenate([label_binary_vector, label_continuous_vector], axis=1)
+            #label_continuous_vector = self.pattern_matching_continous_position(full_label)
+            label_vector = label_binary_vector # numpy.concatenate([label_binary_vector  , label_continuous_vector], axis=1)
 
             if self.add_frame_features:
                 current_block_binary_array = numpy.zeros((frame_number, self.dict_size + self.frame_feature_size))
@@ -458,6 +482,16 @@ class HTSLabelNormalisation(LabelNormalisation):
 
         logger.info('loaded %s, %3d labels' % (file_name, ph_count))
         logger.debug('made label matrix of %d frames x %d labels' % label_feature_matrix.shape)
+        new_vector=[]
+        for val in label_feature_matrix[0]:
+            if val==1:
+                new_vector.append(0.999)
+            else:
+                new_vector.append(0.01)
+
+        #print(new_vector)
+        #value_temp=[(value-min(new_vector))/(max(new_vector)-min(new_vector)) for value in new_vector ]
+        #print('label_feature_matrix {}'.format(value_temp))
         return label_feature_matrix
 
     def load_labels_with_state_alignment(self, file_name):
@@ -988,15 +1022,43 @@ class HTSDurationLabelNormalisation(HTSLabelNormalisation):
 
 
 #  -----------------------------
-
-
+from min_max_norm import MinMaxNormalisation
 if __name__ == '__main__':
-    label_operater = HTSLabelNormalisation(question_file_name=qs_file_name, add_frame_features=False,
-                                           subphone_feats='none')
-    data = label_operater.perform_normalisation(ori_file_list, output_file_list, label_type='phone_align')
-    features, frames_num = BinaryIOCollection().load_binary_file_frame(
-        '/home/rania/Documents/workspace/tools/merlin/binary_label_350/ffr0009sent_boole_0001.lab',
-        label_operater.dimension)
-    print(features.shape)
-    # print(data)
+    args=build_arg_parser().parse_args()
+    file_id_list=args.file_id_list
+    output_dir=args.output_dir
+    config={
+    'label_type':'phone_align',
+    'qs_file_name':'/mnt/mydrive/home/aghilas/Workspace/Experiments/SynPaFlex-Code/VoiceConversion/cvc-via-ppg/data_fr/misc_question/questions-french_pau-v1.hed',
+
+    }
+
+
+    with codecs.open(file_id_list,'r','utf-8') as fileList:
+        data_file_list=[ upSampling(item.strip()) for item in fileList.readlines() if os.path.exists(item.strip())]
+
+    print(" data file list size {}".format(len(data_file_list)))
+
+
+    n_samples=len(data_file_list)
+    print('number of samples {}'.format(n_samples))
+
+
+    with mp.Pool(4) as p:
+        results=list(
+            tqdm(
+                p.imap(
+                    run,  #this function is too long and too specifique
+                    zip(
+                        data_file_list,
+                        [output_dir]*n_samples,
+                        [config]*n_samples,
+                        )
+                ),
+                total=n_samples,
+            )
+        )
+
+
+    # prin
 
